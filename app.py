@@ -232,6 +232,9 @@ if run:
     for col in ("Malicious", "Status", "Keterangan"):
         if col not in work_df.columns:
             work_df[col] = None
+        # Paksa dtype object -- kolom kosong dari file Excel bisa terbaca
+        # sebagai float64 oleh pandas, yang menolak diisi teks (pandas >= 2.x/3.x).
+        work_df[col] = work_df[col].astype(object)
 
     session = requests.Session()
     session.headers.update({

@@ -256,9 +256,11 @@ if run:
     if skipped:
         status_placeholder.info(f"{skipped} baris dilewati (sudah punya hasil sebelumnya).")
 
-    # "Keterangan" tetap dihitung secara internal (dipakai untuk fitur resume /
-    # debugging error), tapi sengaja tidak ditampilkan maupun diunduh.
-    display_cols = ["URL", "Malicious", "Status"]
+    # Saat proses berjalan, kolom "Keterangan" tetap ditampilkan (berguna untuk
+    # memantau progres). Setelah selesai, hasil akhir & file Excel hanya berisi
+    # URL, Malicious, Status.
+    progress_cols = ["URL", "Malicious", "Status", "Keterangan"]
+    final_cols = ["URL", "Malicious", "Status"]
 
     try:
         for done, idx in enumerate(to_process, start=1):
@@ -288,7 +290,7 @@ if run:
                     work_df.loc[idx, ["Malicious", "Status", "Keterangan"]] = [None, "ERROR", str(e)]
                     progress.progress(done / max(len(to_process), 1))
                     table_placeholder.dataframe(
-                        work_df[display_cols].style.apply(status_row_style, axis=1),
+                        work_df[progress_cols].style.apply(status_row_style, axis=1),
                         use_container_width=True,
                     )
                     status_placeholder.error(f"Berhenti: {e}")
@@ -296,13 +298,13 @@ if run:
 
             progress.progress(done / max(len(to_process), 1))
             table_placeholder.dataframe(
-                work_df[display_cols].style.apply(status_row_style, axis=1),
+                work_df[progress_cols].style.apply(status_row_style, axis=1),
                 use_container_width=True,
             )
     finally:
         session.close()
 
-    st.session_state.results_df = work_df[display_cols]
+    st.session_state.results_df = work_df[final_cols]
     log_placeholder.empty()
     status_placeholder.success("✅ Selesai memproses semua URL.")
 

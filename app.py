@@ -256,7 +256,9 @@ if run:
     if skipped:
         status_placeholder.info(f"{skipped} baris dilewati (sudah punya hasil sebelumnya).")
 
-    display_cols = ["URL", "Malicious", "Status", "Keterangan"]
+    # "Keterangan" tetap dihitung secara internal (dipakai untuk fitur resume /
+    # debugging error), tapi sengaja tidak ditampilkan maupun diunduh.
+    display_cols = ["URL", "Malicious", "Status"]
 
     try:
         for done, idx in enumerate(to_process, start=1):

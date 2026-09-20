@@ -29,9 +29,10 @@ class ProcessingError(Exception):
     """Error yang bisa ditampilkan langsung ke user (pesan sudah ramah)."""
 
 
-# ================= LOGIKA DUPLIKAT =================
-def hitung_duplikat(df: pd.DataFrame, qname_col: str, threshold: int, count_col: str = None) -> pd.DataFrame:
-    """Kelompokkan berdasarkan qname, lalu hitung Count.
+# ================= LOGIKA DUPLIKAT (TAHAP 1: murni hitung, tanpa status/warna) =================
+def hitung_duplikat(df: pd.DataFrame, qname_col: str, count_col: str = None) -> pd.DataFrame:
+    """Kelompokkan berdasarkan qname, lalu hitung Count. Tidak menentukan status apa pun di sini —
+    penandaan phishing (berdasarkan Count dan/atau hasil VirusTotal) dilakukan di Tahap 2.
 
     Jika count_col diisi, Count = jumlah (sum) nilai kolom tersebut per qname
     (dipakai kalau file sumber sudah punya kolom count sendiri).
@@ -79,13 +80,30 @@ def hitung_duplikat(df: pd.DataFrame, qname_col: str, threshold: int, count_col:
             "dianggap 0 dan tetap diproses."
         )
 
-    counts["Status"] = counts["Count"].apply(
-        lambda c: PHISHING_STATUS if c > threshold else SAFE_STATUS
-    )
     counts["Malicious"] = None
     counts["Info VT"] = None
     counts = counts.sort_values("Count", ascending=False).reset_index(drop=True)
     return counts
+
+
+def tentukan_status(df: pd.DataFrame, count_threshold: int, vt_threshold: int) -> pd.DataFrame:
+    """TAHAP 2: tentukan Status akhir berdasarkan Count dan/atau hasil VirusTotal (Malicious).
+
+    Sebuah qname ditandai TERINDIKASI PHISHING jika Count melebihi count_threshold,
+    ATAU (jika sudah dicek VT) Malicious melebihi vt_threshold.
+    """
+    df = df.copy()
+
+    def _status(row):
+        if row["Count"] > count_threshold:
+            return PHISHING_STATUS
+        if pd.notna(row.get("Malicious")) and row["Malicious"] > vt_threshold:
+            return PHISHING_STATUS
+        return SAFE_STATUS
+
+    df["Status"] = df.apply(_status, axis=1)
+    cols = ["Qname", "Count", "Malicious", "Info VT", "Status"]
+    return df[[c for c in cols if c in df.columns]]
 
 
 # ================= RATE LIMITER =================

@@ -20,13 +20,47 @@ POLL_MAX_ATTEMPTS = 3
 POLL_INTERVAL_SECONDS = 5
 REQUEST_TIMEOUT = 30
 
-# Public VirusTotal API: batas gratis 4 request per menit (interval 16 detik).
-# Ubah ke 0 jika menggunakan API berbayar (Private API).
-MIN_REQUEST_INTERVAL = 16
+MIN_REQUEST_INTERVAL = 16         # Rate limit VT Public: 4 req/menit
+CHECKPOINT_FILE = "vt_checkpoint.csv"
 
 
 # ============================================================
-# PAGE CONFIG
+# CHECKPOINT MANAGEMENT (FILE CSV LOKAL)
+# ============================================================
+def load_checkpoint() -> dict:
+    """Membaca hasil pengecekan sebelumnya dari file CSV lokal."""
+    if not os.path.exists(CHECKPOINT_FILE):
+        return {}
+    try:
+        df = pd.read_csv(CHECKPOINT_FILE)
+        results = {}
+        for _, row in df.iterrows():
+            qname = str(row["qname"]).strip()
+            mal = None if pd.isna(row["malicious"]) else int(row["malicious"])
+            results[qname] = {
+                "malicious": mal,
+                "status": str(row["status"]),
+                "source": str(row["source"]),
+            }
+        return results
+    except Exception:
+        return {}
+
+
+def append_checkpoint(qname: str, malicious, status: str, source: str):
+    """Menyimpan hasil 1 baris langsung ke disk seketika saat pengecekan selesai."""
+    file_exists = os.path.exists(CHECKPOINT_FILE)
+    df_row = pd.DataFrame([{
+        "qname": qname,
+        "malicious": "" if malicious is None else malicious,
+        "status": status,
+        "source": source,
+    }])
+    df_row.to_csv(CHECKPOINT_FILE, mode="a", header=not file_exists, index=False)
+
+
+# ============================================================
+# PAGE CONFIG & STATE
 # ============================================================
 st.set_page_config(
     page_title="Qname VirusTotal Checker",
@@ -36,9 +70,12 @@ st.set_page_config(
 
 st.title("🛡️ Qname VirusTotal Checker")
 st.caption(
-    "Gabungkan qname yang sama → hitung jumlah kemunculan (hit) → "
-    "cek reputasi VirusTotal → tandai phishing."
+    "Dilengkapi auto-save per baris. Jika koneksi putus atau berhenti di tengah jalan, "
+    "data terakhir langsung tersimpan dan bisa langsung diunduh."
 )
+
+if "is_running" not in st.session_state:
+    st.session_state.is_running = False
 
 
 # ============================================================
@@ -48,29 +85,23 @@ _last_request_time = 0.0
 
 
 def get_default_api_key() -> str:
-    """Membaca API key bawaan dari Streamlit secrets atau environment variable."""
     try:
         key = st.secrets.get("VT_API_KEY", "")
     except Exception:
         key = ""
-
     if not key:
         key = os.environ.get("VT_API_KEY", "")
-
     return str(key).strip()
 
 
 def throttle():
-    """Menjaga jeda request agar tidak terkena HTTP 429 Too Many Requests."""
     global _last_request_time
-
     if MIN_REQUEST_INTERVAL <= 0:
         return
 
     if _last_request_time > 0:
         elapsed = time.monotonic() - _last_request_time
         remaining = MIN_REQUEST_INTERVAL - elapsed
-
         if remaining > 0:
             time.sleep(remaining)
 
@@ -79,7 +110,6 @@ def throttle():
 
 def vt_request(session, method, endpoint, **kwargs):
     throttle()
-
     response = session.request(
         method,
         f"{VT_BASE_URL}{endpoint}",
@@ -91,93 +121,54 @@ def vt_request(session, method, endpoint, **kwargs):
         raise RuntimeError("API key VirusTotal tidak valid.")
 
     if response.status_code == 429:
-        raise RuntimeError(
-            "VirusTotal API rate limit tercapai (HTTP 429). "
-            "Coba lagi nanti atau sesuaikan interval request."
-        )
+        raise RuntimeError("VirusTotal API rate limit (HTTP 429) tercapai.")
 
     return response
 
 
 def url_to_vt_id(url: str) -> str:
-    """Konversi URL ke Base64 URL-safe tanpa padding '=' sesuai format VT."""
     return base64.urlsafe_b64encode(url.encode("utf-8")).decode().rstrip("=")
 
 
 def normalize_qname(value: str) -> str:
-    """Menambahkan skema https:// jika qname berupa domain polos."""
     value = str(value).strip()
-
     if not value:
         return ""
-
     if not value.startswith(("http://", "https://")):
         return "https://" + value
-
     return value
 
 
 def get_existing_url_report(session, url: str):
-    """Mengecek apakah laporan URL sudah tersedia di database VirusTotal."""
     vt_id = url_to_vt_id(url)
-
-    response = vt_request(
-        session,
-        "GET",
-        f"/urls/{vt_id}",
-    )
+    response = vt_request(session, "GET", f"/urls/{vt_id}")
 
     if response.status_code == 404:
         return None
 
     response.raise_for_status()
-
     data = response.json().get("data", {})
     attributes = data.get("attributes", {})
-
     stats = attributes.get("last_analysis_stats", {})
-    malicious = int(stats.get("malicious", 0))
-
-    return {
-        "malicious": malicious,
-        "stats": stats,
-        "last_analysis_date": attributes.get("last_analysis_date"),
-    }
+    return int(stats.get("malicious", 0))
 
 
 def submit_url_scan(session, url: str) -> str:
-    """Mengirim URL baru untuk dianalisis oleh VirusTotal."""
-    response = vt_request(
-        session,
-        "POST",
-        "/urls",
-        data={"url": url},
-    )
-
+    response = vt_request(session, "POST", "/urls", data={"url": url})
     response.raise_for_status()
-
     analysis_id = response.json().get("data", {}).get("id")
-
     if not analysis_id:
         raise RuntimeError("VirusTotal tidak mengembalikan Analysis ID.")
-
     return analysis_id
 
 
 def get_analysis_result(session, analysis_id: str):
-    """Melakukan polling status analisis URL yang baru dikirim."""
     for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
-        response = vt_request(
-            session,
-            "GET",
-            f"/analyses/{analysis_id}",
-        )
+        response = vt_request(session, "GET", f"/analyses/{analysis_id}")
         response.raise_for_status()
 
         attributes = response.json().get("data", {}).get("attributes", {})
-        status = attributes.get("status", "unknown")
-
-        if status == "completed":
+        if attributes.get("status") == "completed":
             stats = attributes.get("stats", {})
             return int(stats.get("malicious", 0)), "scan baru"
 
@@ -188,13 +179,10 @@ def get_analysis_result(session, analysis_id: str):
 
 
 def check_virustotal(session, qname: str):
-    """Mengecek database VT terlebih dahulu, jika tidak ada lakukan pemindaian baru."""
     scan_url = normalize_qname(qname)
-
     existing = get_existing_url_report(session, scan_url)
-
     if existing is not None:
-        return existing["malicious"], "database VT"
+        return existing, "database VT"
 
     analysis_id = submit_url_scan(session, scan_url)
     return get_analysis_result(session, analysis_id)
@@ -204,46 +192,28 @@ def check_virustotal(session, qname: str):
 # EXCEL PROCESSING
 # ============================================================
 def group_qnames(uploaded_file):
-    """
-    Membaca Excel dan menghitung akumulasi kemunculan (hit) per qname unik:
-    - Jika kolom 'count' berisi angka > 0, nilainya akan dijumlahkan.
-    - Jika kolom 'count' tidak ada, kosong, atau 0, setiap baris dihitung sebagai 1 hit.
-    """
     df = pd.read_excel(uploaded_file)
-
-    # Normalisasi nama kolom menjadi huruf kecil tanpa spasi berlebih
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # Deteksi kolom domain / qname
     if "qname" not in df.columns:
         alt_cols = [c for c in df.columns if "qname" in c or "domain" in c or "url" in c]
         if alt_cols:
             df.rename(columns={alt_cols[0]: "qname"}, inplace=True)
         else:
-            raise ValueError(
-                "Kolom 'qname' tidak ditemukan di file Excel. "
-                "Pastikan ada kolom dengan nama 'qname'."
-            )
+            raise ValueError("Kolom 'qname' tidak ditemukan di Excel.")
 
     df["qname"] = df["qname"].astype(str).str.strip()
     df = df[df["qname"].ne("") & df["qname"].ne("nan")].copy()
 
-    # Logika penghitungan hit / count
     if "count" in df.columns:
         df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0)
-        # Jika seluruh baris count bernilai 0, hitung berdasarkan frekuensi kemunculan baris
         if (df["count"] == 0).all():
             grouped = df.groupby("qname", as_index=False, sort=False).size()
             grouped.rename(columns={"size": "count"}, inplace=True)
         else:
-            # Jika ada angka, jadikan minimal 1 untuk baris yang bernilai 0
             df["count"] = df["count"].apply(lambda x: 1 if x <= 0 else x)
-            grouped = (
-                df.groupby("qname", as_index=False, sort=False)["count"]
-                .sum()
-            )
+            grouped = df.groupby("qname", as_index=False, sort=False)["count"].sum()
     else:
-        # Jika tidak ada kolom count sama sekali di file asal, hitung frekuensi per baris
         grouped = df.groupby("qname", as_index=False, sort=False).size()
         grouped.rename(columns={"size": "count"}, inplace=True)
 
@@ -252,12 +222,7 @@ def group_qnames(uploaded_file):
 
 
 def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
-    """
-    Membuat file Excel output yang hanya berisi kolom 'qname' dan 'count'.
-    Baris terindikasi phishing diberi warna latar merah tua dengan font putih tebal.
-    """
     output = io.BytesIO()
-
     grouped_df.to_excel(output, index=False, sheet_name="Qname", engine="openpyxl")
     output.seek(0)
 
@@ -265,12 +230,7 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
     sheet = workbook["Qname"]
 
     thin_side = Side(style="thin", color="000000")
-    border = Border(
-        left=thin_side,
-        right=thin_side,
-        top=thin_side,
-        bottom=thin_side,
-    )
+    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
     header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
     normal_fill = PatternFill(fill_type="solid", fgColor="FFFFFF")
@@ -280,14 +240,12 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
     normal_font = Font(bold=False, color="000000")
     phishing_font = Font(bold=True, color="FFFFFF")
 
-    # Format Header
     for cell in sheet[1]:
         cell.fill = header_fill
         cell.font = header_font
         cell.border = border
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Format Isi Baris
     for row in range(2, sheet.max_row + 1):
         qname = str(sheet.cell(row=row, column=1).value).strip()
         is_phishing = qname in phishing_qnames
@@ -299,7 +257,6 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
                 horizontal="center" if col == 2 else "left",
                 vertical="center",
             )
-
             if is_phishing:
                 cell.fill = phishing_fill
                 cell.font = phishing_font
@@ -315,7 +272,6 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
     result = io.BytesIO()
     workbook.save(result)
     result.seek(0)
-
     return result.getvalue()
 
 
@@ -323,195 +279,173 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
 # STREAMLIT UI
 # ============================================================
 with st.sidebar:
-    st.header("Konfigurasi")
-
-    default_key = get_default_api_key()
-
+    st.header("⚙️ Pengaturan")
     user_api_key = st.text_input(
         "VirusTotal API Key",
-        value=default_key,
+        value=get_default_api_key(),
         type="password",
-        help="Masukkan API key VirusTotal Anda di sini. Input ini diprioritaskan dibanding Secrets/Env.",
     )
-
     api_key = user_api_key.strip()
 
-    if api_key:
-        st.success("VirusTotal API Key: siap digunakan")
-    else:
-        st.error("VirusTotal API Key belum diisi.")
-
     st.divider()
-    st.write(f"Threshold: **malicious > {VT_THRESHOLD}**")
-    st.write(f"Polling: **{POLL_MAX_ATTEMPTS}x**")
-    st.write(f"Request interval: **{MIN_REQUEST_INTERVAL} detik**")
+    if st.button("🗑️ Reset & Hapus Checkpoint"):
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+        st.success("File checkpoint berhasil dihapus.")
+        st.rerun()
 
-
-uploaded_file = st.file_uploader(
-    "Upload Excel",
-    type=["xlsx", "xls"],
-    help="Upload file Excel yang berisi kolom qname (dan opsional kolom count).",
-)
+uploaded_file = st.file_uploader("Upload Excel", type=["xlsx", "xls"])
 
 if uploaded_file is not None:
     try:
         grouped_df = group_qnames(uploaded_file)
+        
+        # Load progress terakhir dari file checkpoint lokal
+        checkpoint_data = load_checkpoint()
 
-        st.subheader("Hasil Grouping & Perhitungan Hit")
+        total_qnames = len(grouped_df)
+        selesai = sum(1 for q in grouped_df["qname"] if q in checkpoint_data)
+        tersisa = total_qnames - selesai
 
-        col1, col2 = st.columns(2)
-        col1.metric("Total qname unik", len(grouped_df))
-        col2.metric("Total hit terakumulasi", int(grouped_df["count"].sum()))
+        st.subheader("Status Antrean")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Qname Unik", total_qnames)
+        m2.metric("Selesai Dicek", selesai)
+        m3.metric("Belum Dicek", tersisa)
 
-        st.dataframe(
-            grouped_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(grouped_df, use_container_width=True, hide_index=True)
 
         if not api_key:
-            st.warning(
-                "Masukkan VT_API_KEY pada sidebar sebelah kiri terlebih dahulu sebelum melakukan pengecekan."
-            )
+            st.warning("Masukkan API Key di panel kiri terlebih dahulu.")
             st.stop()
 
-        if st.button(
-            "🔍 Cek VirusTotal",
-            type="primary",
-            use_container_width=True,
-        ):
+        col_btn1, col_btn2 = st.columns([3, 1])
+        with col_btn1:
+            btn_text = "▶️ Lanjutkan Pengecekan" if selesai > 0 else "🔍 Mulai Pengecekan"
+            start_clicked = st.button(
+                btn_text,
+                type="primary",
+                use_container_width=True,
+                disabled=(tersisa == 0),
+            )
+        with col_btn2:
+            stop_clicked = st.button("⏹️ Hentikan", use_container_width=True)
+
+        if stop_clicked:
+            st.session_state.is_running = False
+            st.warning("Proses dihentikan oleh pengguna.")
+
+        if start_clicked:
+            st.session_state.is_running = True
+
+        # Proses Pengecekan
+        if st.session_state.is_running and tersisa > 0:
             session = requests.Session()
             session.headers.update(
                 {
                     "x-apikey": api_key,
                     "Accept": "application/json",
-                    "User-Agent": "Qname-VirusTotal-Checker/1.0",
+                    "User-Agent": "Qname-VT-Checker/3.0",
                 }
             )
 
-            phishing_qnames = set()
-            result_rows = []
-
-            progress = st.progress(0)
+            progress_bar = st.progress(selesai / total_qnames)
             status_box = st.empty()
 
-            total = len(grouped_df)
-
             try:
-                for index, row in grouped_df.iterrows():
+                for idx, row in grouped_df.iterrows():
                     qname = str(row["qname"]).strip()
-                    count = int(row["count"])
 
-                    current = len(result_rows) + 1
+                    # Lewati domain yang sudah pernah tersimpan di checkpoint
+                    if qname in checkpoint_data:
+                        continue
 
-                    status_box.write(
-                        f"**[{current}/{total}]** Mengecek `{qname}` "
-                        f"(akumulasi hit: {count})"
+                    status_box.info(
+                        f"**[{selesai + 1}/{total_qnames}]** Memeriksa `{qname}` ke VirusTotal..."
                     )
 
                     try:
                         malicious, source = check_virustotal(session, qname)
 
                         if malicious is not None and malicious > VT_THRESHOLD:
-                            phishing_qnames.add(qname)
-                            status = "TERINDIKASI PHISHING"
+                            st_text = "TERINDIKASI PHISHING"
                         elif malicious is None:
-                            status = "SCAN BELUM SELESAI"
+                            st_text = "SCAN BELUM SELESAI"
                         else:
-                            status = "TIDAK TERINDIKASI PHISHING"
+                            st_text = "BERSIH"
 
-                        result_rows.append(
-                            {
-                                "qname": qname,
-                                "count": count,
-                                "malicious": malicious,
-                                "status": status,
-                                "source": source,
-                            }
-                        )
+                        append_checkpoint(qname, malicious, st_text, source)
+                        checkpoint_data[qname] = {"malicious": malicious, "status": st_text, "source": source}
 
-                    except requests.exceptions.Timeout:
-                        result_rows.append(
-                            {
-                                "qname": qname,
-                                "count": count,
-                                "malicious": None,
-                                "status": "TIMEOUT",
-                                "source": "error",
-                            }
-                        )
+                    except Exception as err:
+                        append_checkpoint(qname, None, f"ERROR: {str(err)[:40]}", "error")
+                        checkpoint_data[qname] = {"malicious": None, "status": "ERROR", "source": "error"}
 
-                    except requests.RequestException as exc:
-                        result_rows.append(
-                            {
-                                "qname": qname,
-                                "count": count,
-                                "malicious": None,
-                                "status": f"ERROR REQUEST: {exc}",
-                                "source": "error",
-                            }
-                        )
+                    selesai += 1
+                    progress_bar.progress(selesai / total_qnames)
 
-                    except Exception as exc:
-                        result_rows.append(
-                            {
-                                "qname": qname,
-                                "count": count,
-                                "malicious": None,
-                                "status": f"ERROR: {exc}",
-                                "source": "error",
-                            }
-                        )
-
-                    progress.progress(current / total)
+                st.session_state.is_running = False
+                status_box.success("Seluruh domain selesai dicek.")
+                time.sleep(1)
+                st.rerun()
 
             finally:
                 session.close()
 
-            status_box.success("Pengecekan selesai.")
+        # Bagian Download Data Hasil Terakhir
+        if selesai > 0:
+            st.divider()
+            st.subheader("Hasil Terkumpul Saat Ini")
 
-            result_df = pd.DataFrame(result_rows)
+            phishing_set = set()
+            display_rows = []
 
-            phishing_count = sum(result_df["status"].eq("TERINDIKASI PHISHING"))
-            clean_count = sum(result_df["status"].eq("TIDAK TERINDIKASI PHISHING"))
+            for _, row in grouped_df.iterrows():
+                q = row["qname"]
+                c = row["count"]
+                info = checkpoint_data.get(q)
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Qname dicek", len(result_df))
-            c2.metric("Terindikasi phishing", phishing_count)
-            c3.metric("Tidak terindikasi", clean_count)
+                if info:
+                    mal = info["malicious"]
+                    st_val = info["status"]
+                    src = info["source"]
+                    if mal is not None and mal > VT_THRESHOLD:
+                        phishing_set.add(q)
+                else:
+                    mal = None
+                    st_val = "BELUM DICEK"
+                    src = "-"
 
-            st.subheader("Hasil Analisis Reputasi")
+                display_rows.append({
+                    "qname": q,
+                    "count": c,
+                    "malicious": mal,
+                    "status": st_val,
+                    "source": src,
+                })
 
-            display_df = result_df[
-                ["qname", "count", "malicious", "status", "source"]
-            ]
+            res_df = pd.DataFrame(display_rows)
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
 
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
+            # Excel hanya mewarnai domain yang sudah dicek dan terbukti phishing
+            excel_bytes = create_excel(grouped_df, phishing_set)
+
+            label_download = (
+                "⬇️ Download Excel Lengkap"
+                if tersisa == 0
+                else f"⬇️ Download Hasil Sementara ({selesai}/{total_qnames} Selesai)"
             )
 
-            final_excel = create_excel(grouped_df, phishing_qnames)
-
             st.download_button(
-                label="⬇️ Download Excel Hasil",
-                data=final_excel,
+                label=label_download,
+                data=excel_bytes,
                 file_name="qname_virustotal_result.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 use_container_width=True,
             )
 
-            st.caption(
-                "Excel hasil berisi kolom 'qname' dan 'count'. "
-                "Baris dengan malicious > 2 diberi sorotan merah dengan font putih tebal."
-            )
-
     except Exception as exc:
-        st.error(f"Gagal membaca Excel: {exc}")
+        st.error(f"Gagal memproses data: {exc}")
 else:
-    st.info("Upload file Excel berisi daftar qname untuk memulai proses.")
+    st.info("Upload file Excel berisi kolom **qname** untuk memulai proses.")

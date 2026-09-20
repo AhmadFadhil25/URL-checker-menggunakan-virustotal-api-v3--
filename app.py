@@ -20,13 +20,13 @@ POLL_MAX_ATTEMPTS = 3
 POLL_INTERVAL_SECONDS = 5
 REQUEST_TIMEOUT = 30
 
-# Public VirusTotal API: keep a conservative interval between requests.
-# Change to 0 only if your API plan/rate limits allow it.
+# Public VirusTotal API: batas gratis 4 request per menit (interval 16 detik).
+# Ubah ke 0 jika menggunakan API berbayar (Private API).
 MIN_REQUEST_INTERVAL = 16
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIG
 # ============================================================
 st.set_page_config(
     page_title="Qname VirusTotal Checker",
@@ -36,19 +36,19 @@ st.set_page_config(
 
 st.title("🛡️ Qname VirusTotal Checker")
 st.caption(
-    "Gabungkan qname yang sama → hitung jumlah kemunculan → "
+    "Gabungkan qname yang sama → hitung jumlah kemunculan (hit) → "
     "cek reputasi VirusTotal → tandai phishing."
 )
 
 
 # ============================================================
-# VIRUSTOTAL
+# VIRUSTOTAL FUNCTIONS
 # ============================================================
 _last_request_time = 0.0
 
 
 def get_default_api_key() -> str:
-    """Read API key from Streamlit secrets or environment variable."""
+    """Membaca API key bawaan dari Streamlit secrets atau environment variable."""
     try:
         key = st.secrets.get("VT_API_KEY", "")
     except Exception:
@@ -61,6 +61,7 @@ def get_default_api_key() -> str:
 
 
 def throttle():
+    """Menjaga jeda request agar tidak terkena HTTP 429 Too Many Requests."""
     global _last_request_time
 
     if MIN_REQUEST_INTERVAL <= 0:
@@ -99,18 +100,12 @@ def vt_request(session, method, endpoint, **kwargs):
 
 
 def url_to_vt_id(url: str) -> str:
-    """
-    VirusTotal accepts an unpadded URL-safe Base64 representation
-    as a URL identifier.
-    """
+    """Konversi URL ke Base64 URL-safe tanpa padding '=' sesuai format VT."""
     return base64.urlsafe_b64encode(url.encode("utf-8")).decode().rstrip("=")
 
 
 def normalize_qname(value: str) -> str:
-    """
-    Keep the qname as the user's original value, but if it is a bare
-    domain such as example.com, add https:// for VT URL scanning.
-    """
+    """Menambahkan skema https:// jika qname berupa domain polos."""
     value = str(value).strip()
 
     if not value:
@@ -123,12 +118,7 @@ def normalize_qname(value: str) -> str:
 
 
 def get_existing_url_report(session, url: str):
-    """
-    Get the current VirusTotal URL object.
-    Returns:
-        None -> URL has no report
-        dict -> report information
-    """
+    """Mengecek apakah laporan URL sudah tersedia di database VirusTotal."""
     vt_id = url_to_vt_id(url)
 
     response = vt_request(
@@ -156,9 +146,7 @@ def get_existing_url_report(session, url: str):
 
 
 def submit_url_scan(session, url: str) -> str:
-    """
-    Submit URL for a new VirusTotal analysis.
-    """
+    """Mengirim URL baru untuk dianalisis oleh VirusTotal."""
     response = vt_request(
         session,
         "POST",
@@ -168,11 +156,7 @@ def submit_url_scan(session, url: str) -> str:
 
     response.raise_for_status()
 
-    analysis_id = (
-        response.json()
-        .get("data", {})
-        .get("id")
-    )
+    analysis_id = response.json().get("data", {}).get("id")
 
     if not analysis_id:
         raise RuntimeError("VirusTotal tidak mengembalikan Analysis ID.")
@@ -181,9 +165,7 @@ def submit_url_scan(session, url: str) -> str:
 
 
 def get_analysis_result(session, analysis_id: str):
-    """
-    Poll analysis status.
-    """
+    """Melakukan polling status analisis URL yang baru dikirim."""
     for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
         response = vt_request(
             session,
@@ -206,13 +188,7 @@ def get_analysis_result(session, analysis_id: str):
 
 
 def check_virustotal(session, qname: str):
-    """
-    Check existing VT report first.
-    If no report exists, submit a new scan.
-
-    Returns:
-        malicious_score, source
-    """
+    """Mengecek database VT terlebih dahulu, jika tidak ada lakukan pemindaian baru."""
     scan_url = normalize_qname(qname)
 
     existing = get_existing_url_report(session, scan_url)
@@ -229,67 +205,65 @@ def check_virustotal(session, qname: str):
 # ============================================================
 def group_qnames(uploaded_file):
     """
-    Input must contain qname and count columns.
-
-    count from the input is treated as the hit count contributed by
-    each row. If qname occurs multiple times, their counts are summed.
+    Membaca Excel dan menghitung akumulasi kemunculan (hit) per qname unik:
+    - Jika kolom 'count' berisi angka > 0, nilainya akan dijumlahkan.
+    - Jika kolom 'count' tidak ada, kosong, atau 0, setiap baris dihitung sebagai 1 hit.
     """
     df = pd.read_excel(uploaded_file)
 
-    # Normalize column names.
+    # Normalisasi nama kolom menjadi huruf kecil tanpa spasi berlebih
     df.columns = [str(c).strip().lower() for c in df.columns]
 
-    required = {"qname", "count"}
-    missing = required - set(df.columns)
-
-    if missing:
-        raise ValueError(
-            f"Kolom wajib tidak ditemukan: {', '.join(sorted(missing))}. "
-            "Excel harus memiliki kolom qname dan count."
-        )
-
-    df = df[["qname", "count"]].copy()
+    # Deteksi kolom domain / qname
+    if "qname" not in df.columns:
+        alt_cols = [c for c in df.columns if "qname" in c or "domain" in c or "url" in c]
+        if alt_cols:
+            df.rename(columns={alt_cols[0]: "qname"}, inplace=True)
+        else:
+            raise ValueError(
+                "Kolom 'qname' tidak ditemukan di file Excel. "
+                "Pastikan ada kolom dengan nama 'qname'."
+            )
 
     df["qname"] = df["qname"].astype(str).str.strip()
-    df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0)
+    df = df[df["qname"].ne("") & df["qname"].ne("nan")].copy()
 
-    # Remove empty qname.
-    df = df[df["qname"].ne("")].copy()
+    # Logika penghitungan hit / count
+    if "count" in df.columns:
+        df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0)
+        # Jika seluruh baris count bernilai 0, hitung berdasarkan frekuensi kemunculan baris
+        if (df["count"] == 0).all():
+            grouped = df.groupby("qname", as_index=False, sort=False).size()
+            grouped.rename(columns={"size": "count"}, inplace=True)
+        else:
+            # Jika ada angka, jadikan minimal 1 untuk baris yang bernilai 0
+            df["count"] = df["count"].apply(lambda x: 1 if x <= 0 else x)
+            grouped = (
+                df.groupby("qname", as_index=False, sort=False)["count"]
+                .sum()
+            )
+    else:
+        # Jika tidak ada kolom count sama sekali di file asal, hitung frekuensi per baris
+        grouped = df.groupby("qname", as_index=False, sort=False).size()
+        grouped.rename(columns={"size": "count"}, inplace=True)
 
-    # Sum count for identical qname.
-    grouped = (
-        df.groupby("qname", as_index=False, sort=False)["count"]
-        .sum()
-    )
-
-    # Make count an integer when possible.
     grouped["count"] = grouped["count"].astype(int)
-
     return grouped
 
 
 def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
     """
-    Create final Excel with ONLY:
-        qname
-        count
-
-    Phishing rows:
-        red fill
-        white bold font
-
-    All cells have borders.
+    Membuat file Excel output yang hanya berisi kolom 'qname' dan 'count'.
+    Baris terindikasi phishing diberi warna latar merah tua dengan font putih tebal.
     """
     output = io.BytesIO()
 
-    # Write dataframe first.
     grouped_df.to_excel(output, index=False, sheet_name="Qname", engine="openpyxl")
     output.seek(0)
 
     workbook = load_workbook(output)
     sheet = workbook["Qname"]
 
-    # Styles.
     thin_side = Side(style="thin", color="000000")
     border = Border(
         left=thin_side,
@@ -298,46 +272,24 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
         bottom=thin_side,
     )
 
-    header_fill = PatternFill(
-        fill_type="solid",
-        fgColor="D9EAF7",
-    )
-    normal_fill = PatternFill(
-        fill_type="solid",
-        fgColor="FFFFFF",
-    )
-    phishing_fill = PatternFill(
-        fill_type="solid",
-        fgColor="C00000",
-    )
+    header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
+    normal_fill = PatternFill(fill_type="solid", fgColor="FFFFFF")
+    phishing_fill = PatternFill(fill_type="solid", fgColor="C00000")
 
-    header_font = Font(
-        bold=True,
-        color="000000",
-    )
-    normal_font = Font(
-        bold=False,
-        color="000000",
-    )
-    phishing_font = Font(
-        bold=True,
-        color="FFFFFF",
-    )
+    header_font = Font(bold=True, color="000000")
+    normal_font = Font(bold=False, color="000000")
+    phishing_font = Font(bold=True, color="FFFFFF")
 
-    # Header.
+    # Format Header
     for cell in sheet[1]:
         cell.fill = header_fill
         cell.font = header_font
         cell.border = border
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-        )
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Data rows.
+    # Format Isi Baris
     for row in range(2, sheet.max_row + 1):
         qname = str(sheet.cell(row=row, column=1).value).strip()
-
         is_phishing = qname in phishing_qnames
 
         for col in range(1, 3):
@@ -355,14 +307,9 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
                 cell.fill = normal_fill
                 cell.font = normal_font
 
-    # Column widths.
     sheet.column_dimensions["A"].width = 55
-    sheet.column_dimensions["B"].width = 12
-
-    # Freeze header.
+    sheet.column_dimensions["B"].width = 14
     sheet.freeze_panes = "A2"
-
-    # Auto filter.
     sheet.auto_filter.ref = sheet.dimensions
 
     result = io.BytesIO()
@@ -378,15 +325,13 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
 with st.sidebar:
     st.header("Konfigurasi")
 
-    # Ambil key dari environment / secrets sebagai nilai awal jika ada
     default_key = get_default_api_key()
 
-    # Input teks manual untuk API Key
     user_api_key = st.text_input(
         "VirusTotal API Key",
         value=default_key,
         type="password",
-        help="Masukkan API key VirusTotal Anda. Input ini diprioritaskan dibanding Secrets/Env.",
+        help="Masukkan API key VirusTotal Anda di sini. Input ini diprioritaskan dibanding Secrets/Env.",
     )
 
     api_key = user_api_key.strip()
@@ -405,18 +350,18 @@ with st.sidebar:
 uploaded_file = st.file_uploader(
     "Upload Excel",
     type=["xlsx", "xls"],
-    help="Excel harus memiliki dua kolom: qname dan count.",
+    help="Upload file Excel yang berisi kolom qname (dan opsional kolom count).",
 )
 
 if uploaded_file is not None:
     try:
         grouped_df = group_qnames(uploaded_file)
 
-        st.subheader("Hasil Grouping")
+        st.subheader("Hasil Grouping & Perhitungan Hit")
 
         col1, col2 = st.columns(2)
         col1.metric("Total qname unik", len(grouped_df))
-        col2.metric("Total hit", int(grouped_df["count"].sum()))
+        col2.metric("Total hit terakumulasi", int(grouped_df["count"].sum()))
 
         st.dataframe(
             grouped_df,
@@ -461,14 +406,11 @@ if uploaded_file is not None:
 
                     status_box.write(
                         f"**[{current}/{total}]** Mengecek `{qname}` "
-                        f"(count: {count})"
+                        f"(akumulasi hit: {count})"
                     )
 
                     try:
-                        malicious, source = check_virustotal(
-                            session,
-                            qname,
-                        )
+                        malicious, source = check_virustotal(session, qname)
 
                         if malicious is not None and malicious > VT_THRESHOLD:
                             phishing_qnames.add(qname)
@@ -528,22 +470,17 @@ if uploaded_file is not None:
 
             status_box.success("Pengecekan selesai.")
 
-            # Show summary only; these columns are NOT written to Excel.
             result_df = pd.DataFrame(result_rows)
 
-            phishing_count = sum(
-                result_df["status"].eq("TERINDIKASI PHISHING")
-            )
-            clean_count = sum(
-                result_df["status"].eq("TIDAK TERINDIKASI PHISHING")
-            )
+            phishing_count = sum(result_df["status"].eq("TERINDIKASI PHISHING"))
+            clean_count = sum(result_df["status"].eq("TIDAK TERINDIKASI PHISHING"))
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Qname dicek", len(result_df))
             c2.metric("Terindikasi phishing", phishing_count)
             c3.metric("Tidak terindikasi", clean_count)
 
-            st.subheader("Hasil Pengecekan")
+            st.subheader("Hasil Analisis Reputasi")
 
             display_df = result_df[
                 ["qname", "count", "malicious", "status", "source"]
@@ -555,11 +492,7 @@ if uploaded_file is not None:
                 hide_index=True,
             )
 
-            # Excel output remains ONLY qname + count.
-            final_excel = create_excel(
-                grouped_df,
-                phishing_qnames,
-            )
+            final_excel = create_excel(grouped_df, phishing_qnames)
 
             st.download_button(
                 label="⬇️ Download Excel Hasil",
@@ -574,15 +507,11 @@ if uploaded_file is not None:
             )
 
             st.caption(
-                "Excel hasil hanya berisi kolom qname dan count. "
-                "Baris dengan VT malicious > 2 diberi warna merah "
-                "dengan teks putih tebal."
+                "Excel hasil berisi kolom 'qname' dan 'count'. "
+                "Baris dengan malicious > 2 diberi sorotan merah dengan font putih tebal."
             )
 
     except Exception as exc:
         st.error(f"Gagal membaca Excel: {exc}")
 else:
-    st.info(
-        "Upload file Excel dengan kolom **qname** dan **count** "
-        "untuk memulai."
-    )
+    st.info("Upload file Excel berisi daftar qname untuk memulai proses.")

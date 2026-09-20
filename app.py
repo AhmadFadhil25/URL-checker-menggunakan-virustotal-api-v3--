@@ -193,16 +193,14 @@ def check_qname_virustotal(session, limiter, qname, max_age_days, poll_max_attem
 
 
 # ================= STYLING (tampilan di web) =================
-def status_row_style(row, vt_threshold=None):
+def status_row_style(row):
     if row.get("Status") == PHISHING_STATUS:
         return ["background-color: #F4CCCC; font-weight: bold"] * len(row)
-    if vt_threshold is not None and pd.notna(row.get("Malicious")) and row.get("Malicious") > vt_threshold:
-        return ["background-color: #FFF2CC; font-weight: bold"] * len(row)
     return [""] * len(row)
 
 
 # ================= EXPORT EXCEL =================
-def to_excel_bytes(df: pd.DataFrame, vt_threshold=None) -> bytes:
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
     if df is None or df.empty:
         raise ProcessingError("Tidak ada data hasil untuk diekspor ke Excel.")
 
@@ -212,7 +210,6 @@ def to_excel_bytes(df: pd.DataFrame, vt_threshold=None) -> bytes:
         ws = writer.sheets["Hasil"]
 
         fill_red = PatternFill("solid", fgColor="F4CCCC")
-        fill_yellow = PatternFill("solid", fgColor="FFF2CC")
         bold = Font(bold=True)
         center = Alignment(horizontal="center", vertical="center")
 
@@ -225,19 +222,12 @@ def to_excel_bytes(df: pd.DataFrame, vt_threshold=None) -> bytes:
             cell.alignment = center
 
         status_col = df.columns.get_loc("Status") + 1
-        malicious_col = df.columns.get_loc("Malicious") + 1 if "Malicious" in df.columns else None
         for r in range(2, len(df) + 2):
             status_val = ws.cell(row=r, column=status_col).value
-            malicious_val = ws.cell(row=r, column=malicious_col).value if malicious_col else None
-            fill = None
-            if status_val == PHISHING_STATUS:
-                fill = fill_red
-            elif vt_threshold is not None and isinstance(malicious_val, (int, float)) and malicious_val > vt_threshold:
-                fill = fill_yellow
             for c in range(1, len(df.columns) + 1):
                 cell = ws.cell(row=r, column=c)
-                if fill:
-                    cell.fill = fill
+                if status_val == PHISHING_STATUS:
+                    cell.fill = fill_red
                     cell.font = bold
                 if c > 1:
                     cell.alignment = center
@@ -262,11 +252,12 @@ except Exception:
     _secret_key = ""
 
 with st.sidebar:
-    st.header("⚙️ Pengaturan Duplikat")
+    st.header("🚩 Pengaturan Status (Tahap 2)")
     threshold = st.number_input(
         "Ambang batas Count (di atas ini = phishing)",
         min_value=0, value=2, step=1,
-        help="Contoh: jika diisi 2, qname yang muncul 3 kali atau lebih akan ditandai merah.",
+        help="Contoh: jika diisi 2, qname yang muncul 3 kali atau lebih akan ditandai merah. "
+             "Ini dipakai di Tahap 2, bukan saat menghitung duplikat di Tahap 1.",
     )
 
     st.divider()
@@ -359,7 +350,7 @@ if "results_df" not in st.session_state:
 if run:
     try:
         with st.spinner("Menghitung..."):
-            new_result = hitung_duplikat(source_df, qname_col, threshold, count_col)
+            new_result = hitung_duplikat(source_df, qname_col, count_col)
         st.session_state.results_df = new_result
         st.toast("✅ Perhitungan berhasil.")
     except ProcessingError as e:
@@ -373,20 +364,22 @@ if run:
 
 if st.session_state.results_df is not None:
     df_res = st.session_state.results_df
-    st.subheader("📊 Hasil Perhitungan Duplikat")
-    st.dataframe(df_res.style.apply(status_row_style, axis=1, vt_threshold=vt_threshold), use_container_width=True)
+    st.subheader("📊 Tahap 1: Hasil Hitung Duplikat")
+    st.caption("Murni hitung — belum ada penandaan phishing di sini.")
+    st.dataframe(df_res[["Qname", "Count"]], use_container_width=True)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     c1.metric("Total Qname Unik", len(df_res))
-    c2.metric("Terindikasi Phishing (Count)", int((df_res["Status"] == PHISHING_STATUS).sum()))
-    c3.metric("Ambang Batas Count", f"> {threshold}")
+    c2.metric("Total Baris Data", int(df_res["Count"].sum()))
 
     st.divider()
-    st.subheader("🌐 Cek ke VirusTotal (opsional)")
+    st.subheader("🌐 Tahap 2: Cek ke VirusTotal & Tentukan Status")
     st.caption(
         "Setiap qname unik di atas akan dicek ke VirusTotal untuk mendapatkan jumlah engine "
-        "yang menandainya sebagai malicious. Proses ini bisa dilanjutkan/di-resume — qname yang "
-        "sudah dicek tidak akan diulang jika terjadi error di tengah jalan."
+        "yang menandainya sebagai malicious. Status akhir (TERINDIKASI PHISHING) ditentukan di sini: "
+        "kalau Count melebihi ambang batas, ATAU Malicious dari VirusTotal melebihi ambang batasnya. "
+        "Proses cek VT bisa dilanjutkan/di-resume — qname yang sudah dicek tidak akan diulang jika "
+        "terjadi error di tengah jalan."
     )
 
     already_checked = int(df_res["Malicious"].notna().sum())
@@ -453,8 +446,9 @@ if st.session_state.results_df is not None:
 
                 progress.progress(done / max(len(to_process), 1))
                 st.session_state.results_df = work_df
+                preview_df = tentukan_status(work_df, threshold, vt_threshold)
                 table_placeholder.dataframe(
-                    work_df.style.apply(status_row_style, axis=1, vt_threshold=vt_threshold),
+                    preview_df.style.apply(status_row_style, axis=1),
                     use_container_width=True,
                 )
             else:
@@ -473,13 +467,21 @@ if st.session_state.results_df is not None:
 
         st.rerun()
 
-    df_final = st.session_state.results_df
+    df_final = tentukan_status(st.session_state.results_df, threshold, vt_threshold)
     st.divider()
-    st.subheader("📋 Hasil Akhir")
-    st.dataframe(df_final.style.apply(status_row_style, axis=1, vt_threshold=vt_threshold), use_container_width=True)
+    st.subheader("📋 Hasil Akhir (Status: Count dan/atau VirusTotal)")
+    st.caption(
+        f"TERINDIKASI PHISHING jika Count > {threshold}, ATAU Malicious (VT) > {vt_threshold}."
+    )
+    st.dataframe(df_final.style.apply(status_row_style, axis=1), use_container_width=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Qname Unik", len(df_final))
+    c2.metric("Terindikasi Phishing", int((df_final["Status"] == PHISHING_STATUS).sum()))
+    c3.metric("Sudah Dicek VT", int(df_final["Malicious"].notna().sum()))
 
     try:
-        excel_bytes = to_excel_bytes(df_final, vt_threshold=vt_threshold)
+        excel_bytes = to_excel_bytes(df_final)
         st.download_button(
             "⬇️ Unduh Hasil (Excel)",
             data=excel_bytes,

@@ -1,4 +1,3 @@
-
 import base64
 import io
 import os
@@ -48,7 +47,7 @@ st.caption(
 _last_request_time = 0.0
 
 
-def get_api_key() -> str:
+def get_default_api_key() -> str:
     """Read API key from Streamlit secrets or environment variable."""
     try:
         key = st.secrets.get("VT_API_KEY", "")
@@ -376,24 +375,31 @@ def create_excel(grouped_df: pd.DataFrame, phishing_qnames: set) -> bytes:
 # ============================================================
 # STREAMLIT UI
 # ============================================================
-api_key = get_api_key()
-
 with st.sidebar:
     st.header("Konfigurasi")
 
-    if api_key:
-        st.success("VirusTotal API Key: tersedia")
-    else:
-        st.error("VirusTotal API Key belum tersedia.")
+    # Ambil key dari environment / secrets sebagai nilai awal jika ada
+    default_key = get_default_api_key()
 
+    # Input teks manual untuk API Key
+    user_api_key = st.text_input(
+        "VirusTotal API Key",
+        value=default_key,
+        type="password",
+        help="Masukkan API key VirusTotal Anda. Input ini diprioritaskan dibanding Secrets/Env.",
+    )
+
+    api_key = user_api_key.strip()
+
+    if api_key:
+        st.success("VirusTotal API Key: siap digunakan")
+    else:
+        st.error("VirusTotal API Key belum diisi.")
+
+    st.divider()
     st.write(f"Threshold: **malicious > {VT_THRESHOLD}**")
     st.write(f"Polling: **{POLL_MAX_ATTEMPTS}x**")
     st.write(f"Request interval: **{MIN_REQUEST_INTERVAL} detik**")
-
-    st.info(
-        "API key sebaiknya disimpan di Streamlit Secrets "
-        "sebagai VT_API_KEY, bukan ditulis langsung di source code."
-    )
 
 
 uploaded_file = st.file_uploader(
@@ -420,7 +426,7 @@ if uploaded_file is not None:
 
         if not api_key:
             st.warning(
-                "Masukkan VT_API_KEY terlebih dahulu sebelum melakukan pengecekan."
+                "Masukkan VT_API_KEY pada sidebar sebelah kiri terlebih dahulu sebelum melakukan pengecekan."
             )
             st.stop()
 

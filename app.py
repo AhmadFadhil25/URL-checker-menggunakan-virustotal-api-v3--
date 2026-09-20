@@ -189,10 +189,42 @@ def check_virustotal(session, qname: str):
 
 
 # ============================================================
+# FILE READING (EXCEL & CSV)
+# ============================================================
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    """Membaca file upload sebagai DataFrame, mendukung .xlsx/.xls maupun .csv."""
+    filename = getattr(uploaded_file, "name", "") or ""
+    ext = Path(filename).suffix.lower()
+
+    if ext == ".csv":
+        # Coba beberapa delimiter & encoding umum agar lebih toleran terhadap variasi file CSV
+        uploaded_file.seek(0)
+        try:
+            return pd.read_csv(uploaded_file, sep=None, engine="python")
+        except Exception:
+            uploaded_file.seek(0)
+            try:
+                return pd.read_csv(uploaded_file, encoding="latin-1", sep=None, engine="python")
+            except Exception:
+                uploaded_file.seek(0)
+                return pd.read_csv(uploaded_file)
+    elif ext in (".xlsx", ".xls"):
+        return pd.read_excel(uploaded_file)
+    else:
+        # Fallback: coba Excel dulu, kalau gagal coba CSV
+        try:
+            uploaded_file.seek(0)
+            return pd.read_excel(uploaded_file)
+        except Exception:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, sep=None, engine="python")
+
+
+# ============================================================
 # EXCEL PROCESSING
 # ============================================================
 def group_qnames(uploaded_file):
-    df = pd.read_excel(uploaded_file)
+    df = read_uploaded_table(uploaded_file)
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     if "qname" not in df.columns:
@@ -200,7 +232,7 @@ def group_qnames(uploaded_file):
         if alt_cols:
             df.rename(columns={alt_cols[0]: "qname"}, inplace=True)
         else:
-            raise ValueError("Kolom 'qname' tidak ditemukan di Excel.")
+            raise ValueError("Kolom 'qname' tidak ditemukan di file.")
 
     df["qname"] = df["qname"].astype(str).str.strip()
     df = df[df["qname"].ne("") & df["qname"].ne("nan")].copy()
@@ -294,7 +326,7 @@ with st.sidebar:
         st.success("File checkpoint berhasil dihapus.")
         st.rerun()
 
-uploaded_file = st.file_uploader("Upload Excel", type=["xlsx", "xls"])
+uploaded_file = st.file_uploader("Upload Excel atau CSV", type=["xlsx", "xls", "csv"])
 
 if uploaded_file is not None:
     try:
@@ -448,4 +480,4 @@ if uploaded_file is not None:
     except Exception as exc:
         st.error(f"Gagal memproses data: {exc}")
 else:
-    st.info("Upload file Excel berisi kolom **qname** untuk memulai proses.")
+    st.info("Upload file Excel atau CSV berisi kolom **qname** untuk memulai proses.")
